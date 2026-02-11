@@ -1,0 +1,45 @@
+# Pursuit-Evasion Hybrid RL - Docker Compose
+# ==========================================
+
+services:
+  # Training service
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+    command: >
+      python train.py 
+      --timesteps 1000000 
+      --n-envs 8 
+      --name docker_training
+
+  # Evaluation service - compare hybrid vs classical
+  evaluate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./models:/app/models
+      - ./eval_comparison:/app/eval_comparison
+    command: >
+      python compare_hybrid_vs_classical.py 
+      --model models/docker_training/best/best_model.zip 
+      --episodes 50 
+      --evader-speed 5.0 
+      --no-plot
+    depends_on:
+      - train
+
+  # Interactive shell for development
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/app
+    stdin_open: true
+    tty: true
+    command: /bin/bash
