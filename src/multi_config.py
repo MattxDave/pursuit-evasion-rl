@@ -14,11 +14,11 @@ from pathlib import Path
 @dataclass
 class ArenaConfig:
     """Arena/playfield parameters."""
-    radius: float = 50.0                    # Larger arena for multi-agent
-    capture_radius: float = 1.5             # Distance to capture evader
+    radius: float = 45.0                    # Tighter arena -> more action
+    capture_radius: float = 2.5             # Generous capture reach for pursuers
     station_capture_radius: float = 3.0     # Distance for evader to capture station
     dt: float = 0.1                         # Time step
-    max_steps: int = 1200                   # 2 minutes max episode
+    max_steps: int = 1500                   # 2.5 minutes max episode
 
 
 @dataclass
@@ -29,30 +29,35 @@ class StationConfig:
     pursuers_per_station: int = 2           # Pursuers guarding each station
     min_station_separation: float = 25.0    # Min distance between stations
     spawn_radius_from_center: float = 0.5   # Station spawn range (fraction of arena)
-    capture_time: float = 0.5               # Time evader must stay at station to capture (0.5s = 5 steps)
+    capture_time: float = 2.0              # Time evader must stay at station to capture (2s = 20 steps)
 
 
 @dataclass
 class PursuerConfig:
     """Pursuer agent parameters."""
-    max_speed: float = 9.0                  # Slightly slower for balance (was 10)
-    turn_rate_deg: float = 150.0            # Less agile than evaders (was 180)
+    max_speed: float = 12.0                 # Faster than evaders to allow interception
+    turn_rate_deg: float = 200.0            # More agile for tighter turns
     
     # Radar system
-    radar_range: float = 35.0               # Detection range (covers more of arena)
+    radar_range: float = 40.0               # Wider detection for earlier reaction
     radar_fov_deg: float = 360.0            # Field of view (360 = omnidirectional)
     
     # Communication
-    comm_range: float = 50.0                # Range for inter-pursuer communication
+    comm_range: float = 60.0                # Longer comms so all pursuers can coordinate
     
     # Battery
     battery_capacity: float = 100.0
-    battery_drain_rate: float = 0.15        # Slower drain for longer chases
-    battery_recharge_rate: float = 0.5      # Recharge rate when at station
+    battery_drain_rate: float = 0.10        # Less drain — pursuers need endurance
+    battery_recharge_rate: float = 0.8      # Faster recharge at station
     
     # Behavior thresholds
-    return_to_base_battery: float = 20.0    # Return when battery below this %
-    intercept_priority_distance: float = 35.0  # Prioritize closer threats
+    return_to_base_battery: float = 15.0    # Lower threshold — stay in fight longer
+    intercept_priority_distance: float = 40.0  # React to threats further out
+
+    # Guard patrol behavior
+    guard_patrol_radius: float = 3.5        # Patrol radius around station (meters)
+    guard_patrol_speed: float = 0.4         # Patrol speed as fraction of max
+    max_time_away_from_station: float = 8.0 # Seconds a partner can be away before forcing guard
 
 
 @dataclass
@@ -94,21 +99,21 @@ class FlockConfig:
 class PursuerRewardConfig:
     """Reward shaping for pursuer RL policy."""
     # Terminal
-    capture_evader: float = 20.0
-    all_evaders_escaped: float = -15.0
-    evader_reached_goal: float = -10.0
-    timeout: float = -5.0
+    capture_evader: float = 30.0            # Strong reward for captures
+    all_evaders_escaped: float = -20.0
+    evader_reached_goal: float = -25.0      # Harsh penalty for losing a station
+    timeout: float = -3.0                   # Lighter timeout penalty (surviving is ok)
     
     # Shaping
-    closing_distance: float = 0.5
-    radar_detection_bonus: float = 0.1
+    closing_distance: float = 1.0           # Stronger chase incentive
+    radar_detection_bonus: float = 0.2
     return_to_station_bonus: float = 2.0
-    coordination_bonus: float = 0.3         # Reward for good team coordination
+    coordination_bonus: float = 0.5         # Reward for good team coordination
     
     # Penalties
-    time_penalty: float = -0.01
-    leave_station_unguarded: float = -1.0
-    low_battery_penalty: float = -0.2
+    time_penalty: float = -0.005
+    leave_station_unguarded: float = -2.0   # Harsher penalty for leaving station open
+    low_battery_penalty: float = -0.1
 
 
 @dataclass

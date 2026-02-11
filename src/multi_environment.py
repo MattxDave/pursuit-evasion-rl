@@ -201,6 +201,9 @@ class MultiAgentPursuitEnv(gym.Env):
                     battery_drain_rate=self.pursuer_cfg.battery_drain_rate,
                     battery_recharge_rate=self.pursuer_cfg.battery_recharge_rate,
                     return_threshold=self.pursuer_cfg.return_to_base_battery,
+                    guard_patrol_radius=self.pursuer_cfg.guard_patrol_radius,
+                    guard_patrol_speed=self.pursuer_cfg.guard_patrol_speed,
+                    max_time_away_from_station=self.pursuer_cfg.max_time_away_from_station,
                 )
                 
                 pursuer.assigned_station = station.station_id
@@ -252,8 +255,7 @@ class MultiAgentPursuitEnv(gym.Env):
                 comm_range=self.evader_cfg.comm_range,
             )
             
-            # ALL evaders are equal attackers - no fixed leader
-            evader.role = EvaderRole.LEADER  # All are attackers
+            # Roles will be assigned by the flock controller
             evader.flock_position_idx = i
             self.evaders.append(evader)
         
@@ -610,18 +612,36 @@ class MultiAgentPursuitEnv(gym.Env):
                 target = next((e for e in self.evaders if e.evader_id == pursuer.target_evader_id), None)
                 if target and not target.is_captured:
                     dist = np.linalg.norm(target.position - pursuer.position)
-                    pursuer_rewards[i] += p_cfg.closing_distance * (1.0 / (dist + 1.0))
+                    # Stronger reward the closer the evader is to our station
+                    station_urgency = 1.0
+                    if my_station:
+                        evader_to_station = np.linalg.norm(target.position - my_station.position)
+                        station_urgency = 1.0 + max(0, 20.0 - evader_to_station) / 10.0  # up to 3x boost
+                    pursuer_rewards[i] += p_cfg.closing_distance * station_urgency / (dist + 1.0)
             
             # Station defense shaping - penalize if evader is capturing our station
             if my_station and my_station.is_active and my_station.capture_progress > 0:
-                # Station is being captured! Strong penalty
-                pursuer_rewards[i] -= 0.5 * my_station.capture_progress
+                # Station is being captured! Severe escalating penalty
+                pursuer_rewards[i] -= 2.0 * my_station.capture_progress
             
             # Reward for staying near assigned station when guarding
             if pursuer.state == PursuerState.GUARDING and my_station:
                 dist_to_station = np.linalg.norm(pursuer.position - my_station.position)
-                if dist_to_station < 10:
-                    pursuer_rewards[i] += 0.01  # Small reward for good positioning
+                if dist_to_station < self.pursuer_cfg.guard_patrol_radius + 2:
+                    pursuer_rewards[i] += 0.03  # Good positioning bonus
+                elif dist_to_station > 15:
+                    pursuer_rewards[i] -= 0.02  # Too far from station
+            
+            # Proactive detection reward — reward spotting evaders early
+            if pursuer.radar_contacts:
+                pursuer_rewards[i] += p_cfg.radar_detection_bonus * min(len(pursuer.radar_contacts), 3)
+            
+            # Coordination bonus — reward when partner is guarding while I intercept
+            if pursuer.partner_id is not None and pursuer.partner_id < len(self.pursuers):
+                partner = self.pursuers[pursuer.partner_id]
+                if (pursuer.state == PursuerState.INTERCEPTING and
+                    partner.state == PursuerState.GUARDING):
+                    pursuer_rewards[i] += p_cfg.coordination_bonus * 0.05
             
             # Battery penalty
             if pursuer.battery_percent < 20:
@@ -802,6 +822,17 @@ class MultiAgentPursuitEnv(gym.Env):
             pursuer.step(act, target, station, self.arena_cfg.dt)
         
         # Execute evader actions
+        formation_targets: Dict[int, np.ndarray] = {}
+        if self.flock and self.evaders:
+            leader = next((e for e in self.evaders if e.role == EvaderRole.LEADER and not e.is_captured), None)
+            if leader is not None:
+                positions = self.flock.get_formation_positions(leader.position, leader.heading)
+                for evader in self.evaders:
+                    if evader.role != EvaderRole.LEADER:
+                        idx = evader.flock_position_idx
+                        if 0 <= idx < len(positions):
+                            formation_targets[evader.evader_id] = positions[idx]
+
         for i, evader in enumerate(self.evaders):
             if evader.is_captured:
                 continue
@@ -811,7 +842,15 @@ class MultiAgentPursuitEnv(gym.Env):
             else:
                 act = self._compute_heuristic_evader_action(evader)
             
-            evader.step(act, self.evaders, self.arena_cfg.dt)
+            evader.step(
+                act,
+                self.evaders,
+                self.arena_cfg.dt,
+                formation_target=formation_targets.get(evader.evader_id),
+                separation_dist=self.evader_cfg.flock_separation,
+                cohesion_weight=self.evader_cfg.flock_cohesion,
+                alignment_weight=self.evader_cfg.flock_alignment,
+            )
         
         # Update flock
         if self.flock:
@@ -884,6 +923,7 @@ class MultiAgentPursuitEnv(gym.Env):
             'grid': '#2a2a4a',
             'station': '#42a5f5',
             'station_glow': '#90caf9',
+            'station_patrol': '#80cbc4',
             'pursuer': '#e91e63',
             'pursuer_guard': '#4fc3f7',
             'evader': '#66bb6a',
@@ -893,6 +933,7 @@ class MultiAgentPursuitEnv(gym.Env):
             'text': '#e0e0e0',
             'text_dim': '#9e9e9e',
             'hud_bg': '#0d0d1a',
+            'formation': '#b0bec5',
         }
         
         if self._fig is None:
@@ -927,6 +968,19 @@ class MultiAgentPursuitEnv(gym.Env):
                 linewidth=2, alpha=alpha, zorder=3
             )
             self._ax.add_patch(station_circle)
+
+            # Guard patrol radius overlay
+            patrol_circle = plt.Circle(
+                station.position,
+                self.pursuer_cfg.guard_patrol_radius,
+                fill=False,
+                edgecolor=C['station_patrol'],
+                linewidth=1.5,
+                linestyle='--',
+                alpha=0.7,
+                zorder=3,
+            )
+            self._ax.add_patch(patrol_circle)
             
             # Capture progress ring
             if station.capture_progress > 0.0:
@@ -992,6 +1046,20 @@ class MultiAgentPursuitEnv(gym.Env):
             )
         
         # === EVADERS ===
+        formation_points = []
+        if self.flock and self.evaders:
+            leader = next((e for e in self.evaders if e.role == EvaderRole.LEADER and not e.is_captured), None)
+            if leader is not None:
+                formation_points = self.flock.get_formation_positions(leader.position, leader.heading)
+
+        if formation_points:
+            for pos in formation_points[1:]:
+                self._ax.scatter(
+                    pos[0], pos[1],
+                    s=60, c=C['formation'], marker='x',
+                    linewidths=1.5, alpha=0.8, zorder=8
+                )
+
         for j, evader in enumerate(self.evaders):
             if evader.is_captured:
                 continue

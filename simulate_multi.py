@@ -225,7 +225,7 @@ def create_trajectory_animation(
         if evader_model:
             evader_obs = obs['evaders'].flatten()
             evader_actions, _ = evader_model.predict(evader_obs, deterministic=True)
-            evader_actions = evader_actions.reshape(env.num_evaders, 2)
+            evader_actions = evader_actions.reshape(env.num_evaders, 3)
         
         obs, _, terminated, truncated, _ = env.step({
             'pursuers': pursuer_actions,
@@ -372,7 +372,7 @@ def plot_trajectories(
         if evader_model:
             evader_obs = obs['evaders'].flatten()
             evader_actions, _ = evader_model.predict(evader_obs, deterministic=True)
-            evader_actions = evader_actions.reshape(env.num_evaders, 2)
+            evader_actions = evader_actions.reshape(env.num_evaders, 3)
         
         obs, _, terminated, truncated, _ = env.step({
             'pursuers': pursuer_actions,

@@ -210,6 +210,11 @@ class SmartPursuer:
     battery_drain_rate: float = 0.2
     battery_recharge_rate: float = 0.5
     return_threshold: float = 20.0  # Return when below this %
+
+    # Guard patrol behavior
+    guard_patrol_radius: float = 3.5
+    guard_patrol_speed: float = 0.4
+    max_time_away_from_station: float = 6.0
     
     # State machine
     state: PursuerState = PursuerState.GUARDING
@@ -316,8 +321,12 @@ class SmartPursuer:
         """
         Decide what action to take based on current state and information.
         
-        STATION DEFENSE: Only pursuers at the station closest to evaders deploy.
-        Other pursuers stay guarding their stations.
+        STATION DEFENSE strategy:
+        - Each pursuer defends its OWN station regardless of global threat ranking
+        - Both pursuers at a station may intercept when multiple evaders are close
+        - One pursuer always stays near the station unless overwhelming threat
+        - Pre-emptive move toward evaders heading toward our station
+        - HUNT MODE: when pursuers outnumber evaders, all converge to hunt
         
         Returns:
             (action_type, target_id)
@@ -335,36 +344,132 @@ class SmartPursuer:
         if self.assigned_station is not None and self.assigned_station < len(stations):
             my_station = stations[self.assigned_station]
         
-        # Get active evaders
+        if my_station is None:
+            return 'guard', None
+        
+        # Get active evaders and pursuers
         active_evaders = [e for e in evaders if not e.is_captured and not e.is_at_goal]
+        active_pursuers = [p for p in pursuers if p.battery > 5.0]
         
         if not active_evaders:
-            # No evaders left - guard station
-            if my_station and my_station.is_at_station(self.position, tolerance=5.0):
+            if my_station.is_at_station(self.position, tolerance=5.0):
                 return 'guard', None
             return 'return', None
         
-        # Find which station is most threatened (closest to any evader)
-        def station_threat(s):
-            return min(np.linalg.norm(e.position - s.position) for e in active_evaders)
+        # Find partner
+        partner = None
+        if self.partner_id is not None and self.partner_id < len(pursuers):
+            partner = pursuers[self.partner_id]
         
-        most_threatened_station = min(stations, key=station_threat)
+        # === HUNT MODE ===
+        # When pursuers significantly outnumber evaders, ALL pursuers converge
+        # to eliminate the remaining evaders (stations are safe with few threats)
+        num_active_evaders = len(active_evaders)
+        num_active_pursuers = len(active_pursuers)
         
-        # Only deploy if MY station is the most threatened one
-        if my_station is not None and my_station.station_id == most_threatened_station.station_id:
-            # My station is under threat - DEPLOY!
-            # Find best target heading toward my station
-            def threat_to_my_station(e):
-                return np.linalg.norm(e.position - my_station.position)
+        if num_active_evaders <= 1 and num_active_pursuers >= 3:
+            # Hunt mode: converge all pursuers on the last evader(s)
+            target = min(active_evaders, key=lambda e: np.linalg.norm(e.position - self.position))
+            self.target_evader_id = target.evader_id
+            return 'intercept', target.evader_id
+        
+        if num_active_evaders <= 2 and num_active_pursuers >= num_active_evaders * 2:
+            # Numerical superiority — each pursuer picks the closest evader
+            target = min(active_evaders, key=lambda e: np.linalg.norm(e.position - self.position))
+            self.target_evader_id = target.evader_id
+            return 'intercept', target.evader_id
+        
+        # === THREAT ASSESSMENT FOR MY STATION ===
+        # Rank evaders by how threatening they are to MY station
+        # Uses both distance and heading (evaders heading toward us are more dangerous)
+        def threat_score(e):
+            to_station = my_station.position - e.position
+            dist = np.linalg.norm(to_station)
+            if dist < 0.1:
+                return 999.0  # Already at station = max threat
+            heading_alignment = np.dot(unit_vector(e.velocity), unit_vector(to_station)) if np.linalg.norm(e.velocity) > 0.1 else 0.0
+            # Higher score = bigger threat. Close + heading toward us = very dangerous
+            return max(0.0, heading_alignment + 0.5) / (dist + 1.0) * 100.0
+        
+        evader_threats = [(e, threat_score(e)) for e in active_evaders]
+        evader_threats.sort(key=lambda x: x[1], reverse=True)
+        
+        # Evaders within our defense zone (radar range or heading toward us)
+        defense_zone_evaders = [
+            (e, score) for e, score in evader_threats
+            if np.linalg.norm(e.position - my_station.position) < self.radar_range * 1.2
+            or score > 2.0  # heading toward us even if far
+        ]
+        
+        num_threats = len(defense_zone_evaders)
+        
+        # URGENT: station is actively being captured — go intercept no matter what
+        if my_station.capture_progress > 0.1:
+            # Station under active attack!
+            attacker = None
+            for e in active_evaders:
+                if my_station.is_in_capture_zone(e.position):
+                    attacker = e
+                    break
+            if attacker:
+                self.target_evader_id = attacker.evader_id
+                return 'intercept', attacker.evader_id
+        
+        if num_threats == 0:
+            # No threats nearby — guard station
+            if my_station.is_at_station(self.position, tolerance=5.0):
+                return 'guard', None
+            return 'return', None
+        
+        # We have at least one threat near our station
+        best_target = defense_zone_evaders[0][0]
+        
+        if num_threats >= 2 and partner is not None:
+            # Multiple evaders approaching — BOTH pursuers can intercept
+            # each takes the closest threat to themselves
+            my_dist_to_first = np.linalg.norm(self.position - defense_zone_evaders[0][0].position)
+            my_dist_to_second = np.linalg.norm(self.position - defense_zone_evaders[1][0].position)
+            partner_dist_to_first = np.linalg.norm(partner.position - defense_zone_evaders[0][0].position)
+            partner_dist_to_second = np.linalg.norm(partner.position - defense_zone_evaders[1][0].position)
             
-            best_target = min(active_evaders, key=threat_to_my_station)
+            # Assign each pursuer to the evader they're closest to (Hungarian-lite)
+            if my_dist_to_first + partner_dist_to_second <= my_dist_to_second + partner_dist_to_first:
+                best_target = defense_zone_evaders[0][0]
+            else:
+                best_target = defense_zone_evaders[1][0]
+            
             self.target_evader_id = best_target.evader_id
             return 'intercept', best_target.evader_id
-        else:
-            # My station is not the primary threat - stay guarding
-            if my_station and my_station.is_at_station(self.position, tolerance=5.0):
-                return 'guard', None
-            return 'return', None
+        
+        # Single threat — coordinate with partner (one intercepts, one guards)
+        if partner is not None:
+            partner_is_intercepting = partner.state == PursuerState.INTERCEPTING
+            partner_chasing_same = partner.target_evader_id == best_target.evader_id
+            
+            if partner_is_intercepting and partner_chasing_same:
+                # Partner already has this target — I guard
+                if my_station.is_at_station(self.position, tolerance=5.0):
+                    return 'guard', None
+                return 'return', None
+            
+            if partner_is_intercepting and not partner_chasing_same:
+                # Partner is chasing something else — I take this target
+                self.target_evader_id = best_target.evader_id
+                return 'intercept', best_target.evader_id
+            
+            # Neither of us is intercepting yet — closer one goes
+            my_dist = np.linalg.norm(self.position - best_target.position)
+            partner_dist = np.linalg.norm(partner.position - best_target.position)
+            
+            if partner_dist < my_dist:
+                # Partner is closer — I stay guarding
+                if my_station.is_at_station(self.position, tolerance=5.0):
+                    return 'guard', None
+                return 'return', None
+        
+        # I'm the one intercepting
+        self.target_evader_id = best_target.evader_id
+        return 'intercept', best_target.evader_id
     
     def compute_intercept_heading(
         self,
@@ -404,12 +509,16 @@ class SmartPursuer:
         throttle = float(np.clip(action[0], 0, 1))
         nudge = float(action[1]) * 0.5  # ±0.5 rad nudge
         
-        # Compute base speed - ALWAYS high speed when chasing
+        # Compute base speed based on urgency
         if target is not None:
             # Chasing target - go full speed!
             requested_speed = self.max_speed
+        elif self.state == PursuerState.RETURNING:
+            # Returning to station urgently - sprint back
+            requested_speed = self.max_speed * 0.85
         else:
-            requested_speed = throttle * self.max_speed
+            # Guarding patrol speed when not chasing
+            requested_speed = max(self.guard_patrol_speed, throttle) * self.max_speed
         
         # Battery limiting
         battery_factor = max(0.4, self.battery / self.battery_capacity)
@@ -426,8 +535,25 @@ class SmartPursuer:
         elif self.state == PursuerState.RETURNING and station is not None:
             base_heading = pure_pursuit(self.position, station.position)
         else:
-            # Guarding - maintain heading or face outward
-            base_heading = self.heading
+            # Guarding - patrol a small circle around the station
+            if station is not None and self.state == PursuerState.GUARDING:
+                to_station = station.position - self.position
+                dist = float(np.linalg.norm(to_station))
+                if dist > 0.1:
+                    radial_dir = to_station / dist
+                else:
+                    radial_dir = self.heading
+                tangential = np.array([-radial_dir[1], radial_dir[0]], dtype=np.float32)
+                radial_error = dist - self.guard_patrol_radius
+                correction = -0.5 * radial_error * radial_dir
+                patrol_vec = tangential + correction
+                if np.linalg.norm(patrol_vec) > 0.1:
+                    base_heading = unit_vector(patrol_vec)
+                else:
+                    base_heading = self.heading
+            else:
+                # Default: maintain heading
+                base_heading = self.heading
         
         # Apply nudge
         desired_heading = rotate_vector(base_heading, nudge)
@@ -454,6 +580,14 @@ class SmartPursuer:
         else:
             # Recharge at station
             self.battery = min(self.battery_capacity, self.battery + self.battery_recharge_rate)
+
+        # Track time away from station for coordination
+        if station is not None:
+            dist_to_station = np.linalg.norm(self.position - station.position)
+            if dist_to_station > self.guard_patrol_radius + 1.0:
+                self.time_away_from_station += dt
+            else:
+                self.time_away_from_station = 0.0
         
         return self.position
     
@@ -501,11 +635,10 @@ class SmartEvader:
     """
     Smart evader with RL-controlled behavior.
     
-    SCATTER TACTICS:
-    - All evaders are independent attackers trying to reach stations
-    - When pursuers approach, evaders SCATTER in different directions
-    - This forces pursuers to choose targets and creates openings
-    - If a pursuer locks onto one evader, others can slip through
+    FLOCK TACTICS:
+    - Leader heads toward the goal (station)
+    - Followers maintain formation while moving toward the goal
+    - Flock shares threat info and applies local evasion when needed
     """
     evader_id: int
     position: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
@@ -740,13 +873,16 @@ class SmartEvader:
         action: np.ndarray,
         flock: List['SmartEvader'],
         dt: float,
+        formation_target: Optional[np.ndarray] = None,
+        separation_dist: float = 3.0,
+        cohesion_weight: float = 0.7,
+        alignment_weight: float = 0.5,
     ) -> np.ndarray:
         """
         Execute one step with RL action.
         
-        SCATTER TACTICS: All evaders are independent attackers.
-        When pursuers approach, they scatter to create openings.
-        If being chased, focus on evasion. If not, push for the goal.
+        FLOCK TACTICS: Stay in formation while progressing toward the goal.
+        If a pursuer gets close, apply local evasion while keeping formation.
         
         Args:
             action: [throttle, heading_adjustment, scatter_signal] from RL policy
@@ -762,69 +898,58 @@ class SmartEvader:
         throttle = float(np.clip(action[0], 0, 1))
         heading_adj = float(action[1]) * 0.5  # Reduced RL influence, more classical control
         scatter_signal = float(action[2]) if len(action) > 2 else 0.0
-        
-        # ALWAYS full speed - this is life or death!
-        self.actual_speed = self.max_speed
-        
+
+        # Use throttle while keeping a minimum speed to avoid stalling
+        self.actual_speed = max(0.6, throttle) * self.max_speed
+
         # Compute forces
         goal_force = self.compute_goal_force()
         evasion_force = self.compute_evasion_force()
-        
-        # SMART TACTICAL ANALYSIS
-        # Find the best opening - direction with fewest/furthest pursuers
-        best_opening = self._find_best_opening(flock)
-        
-        # Count team status
-        chased_evaders = [e for e in flock if e.is_being_chased and not e.is_captured]
-        free_evaders = [e for e in flock if not e.is_being_chased and not e.is_captured]
-        num_chased = len(chased_evaders)
-        num_free = len(free_evaders)
-        
-        # Distance to goal
-        dist_to_goal = np.linalg.norm(self.goal - self.position)
-        
-        # Find closest pursuer distance
-        min_pursuer_dist = 999.0
+        flock_force = self.compute_flock_forces(
+            flock,
+            separation_dist=separation_dist,
+            cohesion_weight=cohesion_weight,
+            alignment_weight=alignment_weight,
+        )
+
+        best_opening = None
+        if scatter_signal > 0.5:
+            best_opening = self._find_best_opening(flock)
+
+        formation_force = np.zeros(2, dtype=np.float32)
+        if formation_target is not None:
+            to_formation = formation_target - self.position
+            if np.linalg.norm(to_formation) > 0.1:
+                formation_force = unit_vector(to_formation)
+
+        # Adjust weights when a pursuer is very close
+        min_pursuer_dist = None
         if self.detected_pursuers:
-            min_pursuer_dist = min(np.linalg.norm(p_pos - self.position) 
-                                   for p_pos in self.detected_pursuers.values())
-        
-        # COMMIT ZONE - when within 6m of goal, SPRINT regardless of pursuers
-        # Station capture radius is 3m, so 6m gives us buffer to reach it
-        if dist_to_goal < 6:
-            # SO CLOSE! Just sprint for it!
-            base_direction = goal_force
-        # EMERGENCY EVASION - pursuer is dangerously close and we're far from goal
-        elif min_pursuer_dist < 8.0:
-            # Pursuer very close - PURE EVASION!
-            base_direction = 0.8 * evasion_force + 0.2 * best_opening
-        elif self.is_being_chased:
-            if num_free >= 1 and dist_to_goal > 15:
-                # Others are free and I'm far from goal - BE THE DECOY
-                # Run perpendicular to goal to pull pursuers sideways
-                perp_dir = np.array([-goal_force[1], goal_force[0]])  # Perpendicular
-                # Choose the perpendicular that's away from pursuers
-                if np.dot(perp_dir, evasion_force) < 0:
-                    perp_dir = -perp_dir
-                base_direction = 0.6 * perp_dir + 0.4 * evasion_force
-            elif dist_to_goal < 20:
-                # I'm close to goal even though chased - SPRINT FOR IT!
-                base_direction = 0.7 * goal_force + 0.3 * evasion_force
+            min_pursuer_dist = min(
+                np.linalg.norm(p_pos - self.position)
+                for p_pos in self.detected_pursuers.values()
+            )
+
+        if min_pursuer_dist is not None and min_pursuer_dist < 8.0:
+            # Emergency scatter when a pursuer is very close
+            if best_opening is None:
+                best_opening = self._find_best_opening(flock)
+            base_direction = 0.70 * evasion_force + 0.30 * best_opening
+        elif min_pursuer_dist is not None and min_pursuer_dist < 10.0:
+            # Strong evasion, but keep formation intent
+            if formation_target is not None:
+                base_direction = 0.55 * evasion_force + 0.30 * formation_force + 0.15 * goal_force
             else:
-                # I'm the last hope or far from goal - use best opening
-                base_direction = 0.5 * best_opening + 0.3 * evasion_force + 0.2 * goal_force
+                base_direction = 0.60 * evasion_force + 0.25 * goal_force + 0.15 * flock_force
+        elif scatter_signal > 0.5 and best_opening is not None:
+            # Voluntary scatter to create openings while still moving forward
+            base_direction = 0.55 * best_opening + 0.30 * goal_force + 0.15 * evasion_force
         else:
-            # I'M FREE - this is my chance!
-            if dist_to_goal < 25:
-                # Close to goal - FULL SPRINT!
-                base_direction = goal_force
-            elif num_chased >= 1:
-                # Teammates are drawing pursuers - use the opening!
-                # Blend toward goal through the best opening
-                base_direction = 0.7 * goal_force + 0.3 * best_opening
+            # Normal flocking behavior
+            if formation_target is not None:
+                base_direction = 0.60 * formation_force + 0.25 * goal_force + 0.15 * flock_force
             else:
-                # No one being chased yet - head for goal but be ready
-                base_direction = 0.8 * goal_force + 0.2 * best_opening
+                base_direction = 0.60 * goal_force + 0.25 * flock_force + 0.15 * evasion_force
         
         if np.linalg.norm(base_direction) < 0.1:
             base_direction = self.heading
